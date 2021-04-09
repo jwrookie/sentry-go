@@ -5,7 +5,9 @@ import (
 	"context"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"math"
 	"net/http"
 	"reflect"
 	"testing"
@@ -99,6 +101,9 @@ func TestStartSpan(t *testing.T) {
 	sampled := SampledTrue
 	startTime := time.Now()
 	endTime := startTime.Add(3 * time.Second)
+	data := map[string]interface{}{
+		"k": "v",
+	}
 	span := StartSpan(ctx, op,
 		TransactionName(transaction),
 		func(s *Span) {
@@ -108,6 +113,7 @@ func TestStartSpan(t *testing.T) {
 			s.Sampled = sampled
 			s.StartTime = startTime
 			s.EndTime = endTime
+			s.Data = data
 		},
 	)
 	span.Finish()
@@ -135,9 +141,10 @@ func TestStartSpan(t *testing.T) {
 			},
 		},
 		Tags: nil,
-		// TODO(tracing): Set Transaction.Data here or in
-		// Contexts.Trace, or somewhere else. Currently ignored.
-		Extra:     nil,
+		// TODO(tracing): the root span / transaction data field is
+		// mapped into Event.Extra for now, pending spec clarification.
+		// https://github.com/getsentry/develop/issues/244#issuecomment-778694182
+		Extra:     span.Data,
 		Timestamp: endTime,
 		StartTime: startTime,
 	}
@@ -159,7 +166,11 @@ func TestStartSpan(t *testing.T) {
 }
 
 func TestStartChild(t *testing.T) {
-	ctx := NewTestContext(ClientOptions{TracesSampleRate: 1.0})
+	transport := &TransportMock{}
+	ctx := NewTestContext(ClientOptions{
+		TracesSampleRate: 1.0,
+		Transport:        transport,
+	})
 	span := StartSpan(ctx, "top", TransactionName("Test Transaction"))
 	child := span.StartChild("child")
 	child.Finish()
@@ -171,6 +182,48 @@ func TestStartChild(t *testing.T) {
 	}
 	c.Check(t, span)
 	c.Check(t, child)
+
+	events := transport.Events()
+	if got := len(events); got != 1 {
+		t.Fatalf("sent %d events, want 1", got)
+	}
+	want := &Event{
+		Type:        transactionType,
+		Transaction: "Test Transaction",
+		Contexts: map[string]interface{}{
+			"trace": &TraceContext{
+				TraceID: span.TraceID,
+				SpanID:  span.SpanID,
+				Op:      span.Op,
+			},
+		},
+		Spans: []*Span{
+			{
+				TraceID:      child.TraceID,
+				SpanID:       child.SpanID,
+				ParentSpanID: child.ParentSpanID,
+				Op:           child.Op,
+				Sampled:      SampledTrue,
+			},
+		},
+	}
+	opts := cmp.Options{
+		cmpopts.IgnoreFields(Event{},
+			"EventID", "Level", "Platform",
+			"Sdk", "ServerName", "Timestamp", "StartTime",
+		),
+		cmpopts.IgnoreMapEntries(func(k string, v interface{}) bool {
+			return k != "trace"
+		}),
+		cmpopts.IgnoreFields(Span{},
+			"StartTime", "EndTime",
+		),
+		cmpopts.IgnoreUnexported(Span{}),
+		cmpopts.EquateEmpty(),
+	}
+	if diff := cmp.Diff(want, events[0], opts); diff != "" {
+		t.Fatalf("Event mismatch (-want +got):\n%s", diff)
+	}
 }
 
 // testContextKey is used to store a value in a context so that we can check
@@ -312,4 +365,30 @@ func TestSpanFromContext(t *testing.T) {
 	// SpanCheck{
 	// 	RecorderLen: 1,
 	// }.Check(t, child)
+}
+
+func TestDoubleSampling(t *testing.T) {
+	transport := &TransportMock{}
+	ctx := NewTestContext(ClientOptions{
+		SampleRate:       math.SmallestNonzeroFloat64,
+		TracesSampleRate: 1.0,
+		Transport:        transport,
+	})
+	span := StartSpan(ctx, "op", TransactionName("name"))
+
+	// CaptureException should not send any event because of SampleRate.
+	GetHubFromContext(ctx).CaptureException(errors.New("ignored"))
+	if got := len(transport.Events()); got != 0 {
+		t.Fatalf("got %d events, want 0", got)
+	}
+
+	// Finish should send one transaction event, always sampled via
+	// TracesSampleRate.
+	span.Finish()
+	if got := len(transport.Events()); got != 1 {
+		t.Fatalf("got %d events, want 1", got)
+	}
+	if got := transport.Events()[0].Type; got != transactionType {
+		t.Fatalf("got %v event, want %v", got, transactionType)
+	}
 }
